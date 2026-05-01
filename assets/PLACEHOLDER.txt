@@ -1,0 +1,6 @@
+Placeholder for assets. Please save your images here with names:
+- esp32_c3_supermini.png
+- passive_buzzer.png
+- charge_discharge_module.png
+- ws2812b_led.png
+- battery_18650.png
