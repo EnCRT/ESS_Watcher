@@ -17,3 +17,6 @@ Thumbs.db
 *.o
 *.a
 *.exe
+
+# Security
+include/secrets.h
