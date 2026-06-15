@@ -1,0 +1,1 @@
+MakitaStartup:d=8,o=5,b=180:c,e,g,o=6,c,e

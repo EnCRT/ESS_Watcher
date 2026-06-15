@@ -5,7 +5,13 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <UniversalTelegramBot.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include "secrets.h"
+#include "ConfigManager.h"
+#include "WebPortal.h"
+#include "BuzzerManager.h"
+#include "SoundStorage.h"
 
 // =====================================================================================
 // =                               НАСТРОЙКИ ПИНОВ                                     =
@@ -14,61 +20,52 @@
 const int PIN_POWER_SENSE = 0; // Пин для мониторинга 3.3В (через делитель на 3.3В!) от блока питания 220В
 const int PIN_BUZZER = 2;      // Пин для зуммера
 const int PIN_LED_DATA = 10;   // Пин для WS2812B
+const int PIN_CONFIG_BUTTON = 9; // Пин для кнопки настройки (BOOT)
 const int NUM_LEDS = 1;
+
+// =====================================================================================
+// =                               ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ                               =
+// =====================================================================================
 
 CRGB leds[NUM_LEDS];
 WiFiClientSecure secured_client;
-
-// =====================================================================================
-// =                               НАСТРОЙКИ СЕТИ И TELEGRAM                         =
-// =====================================================================================
-const char* WIFI_SSID = SECRET_WIFI_SSID;
-const char* WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
-const String BOT_TOKEN = SECRET_BOT_TOKEN;
-const String CHAT_ID = SECRET_CHAT_ID;
-const String MESSAGE_THREAD_ID = SECRET_MESSAGE_THREAD_ID;
+ConfigManager configManager;
+BuzzerManager buzzer;
+WebServer server(80);
+DNSServer dnsServer;
 
 // =====================================================================================
 // =                               ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ                               =
 // =====================================================================================
 
 // Тайминги
-const unsigned long POWER_CHECK_INTERVAL = 500;    // Проверка пина каждые 500 мс (для антидребезга)
-const unsigned long BUFFER_PROCESS_INTERVAL = 10000; // Попытка отправки из буфера каждые 10 сек
-const int DEBOUNCE_THRESHOLD = 5;                   // Сколько раз подряд (по 100мс) статус должен быть стабильным
+const unsigned long POWER_CHECK_INTERVAL = 500;    // Проверка пина каждые 500 мс
+const int DEBOUNCE_THRESHOLD = 5;                   
+const unsigned long CONFIG_HOLD_TIME = 2000;       // Время удержания для входа в настройки
 
 // Состояние питания
 bool isPowerOn = false;
 bool lastPowerState = false;
 unsigned long lastPowerCheckTime = 0;
-
-// Переменные антидребезга (Debounce)
 int debounceCounter = 0;
 bool potentialPowerState = false;
 
-// Состояние Wi-Fi подключения
-bool wifiEnabled = true;          
+// Состояние Wi-Fi и Системы
 bool isWifiConnected = false;
 bool isTimeSynced = false;
 bool startupMessageSent = false;  
-
-// Асинхронные флаги
 bool ntpSyncStarted = false;
 unsigned long lastNTPCheckTime = 0;
 bool needsStartupMessage = false;
+bool isConfigMode = false;
 
-unsigned long lastBufferProcessTime = 0;
+// Индикация (двойной "пых" раз в 2 секунды)
+unsigned long lastBlinkCycleTime = 0;
+const unsigned long BLINK_INTERVAL = 2000;
 
-// Буфер сообщений
-const int MAX_BUFFER_SIZE = 5;
-String messageBuffer[MAX_BUFFER_SIZE];
-int bufferCount = 0;
-
-// Управление зуммером
-bool isBuzzerActive = false;
-unsigned long buzzerStartTime = 0;
-unsigned long buzzerDuration = 0;
-int buzzerFreq = 0;
+// Управление кнопкой
+unsigned long buttonPressStartTime = 0;
+bool isButtonPressed = false;
 
 // =====================================================================================
 // =                              ОСНОВНЫЕ ФУНКЦИИ                                     =
@@ -79,258 +76,383 @@ void setRGBColor(CRGB color) {
     FastLED.show();
 }
 
-void startBuzzer(int freq, unsigned long duration) {
-    buzzerFreq = freq;
-    buzzerDuration = duration;
-    buzzerStartTime = millis();
-    isBuzzerActive = true;
-    
-    // Совместимость с ядром ESP32 версии 2.x
-    ledcSetup(0, freq, 8); // Канал 0, нужная частота, разрешение 8 бит
-    ledcAttachPin(PIN_BUZZER, 0);
-    ledcWriteTone(0, freq);
-}
+void playMelody(const char* melodyFile, bool powerOn) {
+    if (melodyFile != nullptr && strlen(melodyFile) > 0) {
+        String filePath = "/sounds/";
+        filePath += melodyFile;
 
-void stopBuzzer() {
-    isBuzzerActive = false;
-    ledcWriteTone(0, 0); // Отключаем звук
-    ledcDetachPin(PIN_BUZZER);
-}
+        File file = LittleFS.open(filePath, "r");
+        if (file) {
+            String rtttl = "";
+            while (file.available()) {
+                String line = file.readStringUntil('\n');
+                line.trim();
+                if (line.length() > 0 && !line.startsWith("#")) {
+                    rtttl = line;
+                    break;
+                }
+            }
+            file.close();
 
-void handleBuzzerAsync() {
-    if (isBuzzerActive && (millis() - buzzerStartTime >= buzzerDuration)) {
-        stopBuzzer();
+            if (rtttl.length() > 0) {
+                Serial.print("🎵 Играем мелодию из файла: ");
+                Serial.println(filePath);
+                buzzer.play(rtttl);
+                return;
+            }
+        }
+        Serial.print("ℹ️ Файл не найден: ");
+        Serial.println(filePath);
+    }
+
+    // Фоллбэк: встроенные RTTTL-мелодии
+    if (powerOn) {
+        buzzer.play("StdOn:d=8,o=6,b=120:c,p,c,p,c,p,4c");
+    } else {
+        buzzer.play("StdOff:d=1,o=5,b=60:2c");
     }
 }
 
-// Асинхронная проверка статуса NTP
+// Асинхронная индикация статуса: короткий двойной "пых" раз в 2 секунды
+void handleStatusIndicationAsync() {
+    unsigned long currentMillis = millis();
+    unsigned long elapsed = currentMillis - lastBlinkCycleTime;
+    
+    if (elapsed >= BLINK_INTERVAL) {
+        lastBlinkCycleTime = currentMillis;
+        elapsed = 0;
+    }
+
+    CRGB statusColor;
+    if (isConfigMode) {
+        statusColor = CRGB::Blue;
+    } else if (isPowerOn) {
+        statusColor = CRGB::Green;
+    } else {
+        statusColor = CRGB::Red;
+    }
+
+    // Логика двойной вспышки
+    if (elapsed < 60) {
+        setRGBColor(statusColor);
+    } else if (elapsed < 160) {
+        setRGBColor(CRGB::Black);
+    } else if (elapsed < 220) {
+        setRGBColor(statusColor);
+    } else {
+        setRGBColor(CRGB::Black);
+    }
+}
+
 void checkNTPStatusAsync() {
     if (ntpSyncStarted && !isTimeSynced) {
         if (millis() - lastNTPCheckTime >= 1000) {
             lastNTPCheckTime = millis();
             time_t now = time(nullptr);
             if (now > 24 * 3600) {
-                Serial.println("\n✅ Время успешно синхронизировано!");
+                Serial.println("\n✅ Время синхронизировано!");
                 isTimeSynced = true;
                 ntpSyncStarted = false;
-                
-                if (!startupMessageSent) {
-                    needsStartupMessage = true;
-                }
-            } else {
-                Serial.print(".");
+                if (!startupMessageSent) needsStartupMessage = true;
             }
         }
     }
 }
 
 bool sendTelegramMessage(String msg) {
-    if (!wifiEnabled || !isWifiConnected || !isTimeSynced) return false;
+    if (!isWifiConnected) {
+        Serial.println("❌ Ошибка: WiFi не подключен. Сообщение пропущено.");
+        return false;
+    }
+    if (!isTimeSynced) {
+        Serial.println("❌ Ошибка: Время не синхронизировано (NTP). Сообщение пропущено.");
+        return false;
+    }
     
-    Serial.println("🔄 Отправка запроса в Telegram...");
-    
+    Serial.print("📤 Отправка в Telegram: ");
+    Serial.println(msg);
+
     HTTPClient http;
-    String url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage";
+    String url = "https://api.telegram.org/bot" + String(configManager.getBotToken()) + "/sendMessage";
     
-    // Используем уже настроенный secured_client с сертификатами
     http.begin(secured_client, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
     
-    // Формируем правильный JSON с поддержкой топиков (message_thread_id)
     StaticJsonDocument<512> doc;
-    doc["chat_id"] = CHAT_ID;
+    doc["chat_id"] = configManager.getChatID();
     doc["text"] = msg;
-    if (MESSAGE_THREAD_ID.length() > 0 && MESSAGE_THREAD_ID != "null") {
-        doc["message_thread_id"] = MESSAGE_THREAD_ID.toInt();
+    String threadId = configManager.getThreadID();
+    if (threadId.length() > 0 && threadId != "0" && threadId != "null") {
+        doc["message_thread_id"] = threadId.toInt();
     }
     
     String payload;
     serializeJson(doc, payload);
-    
-    // Отправляем ОДНИМ большим пакетом (решает проблему перегрева и спама мелких SSL чанков)
     int httpCode = http.POST(payload);
-    bool success = (httpCode == 200);
     
-    if (success) {
-        Serial.println("✅ Telegram: Сообщение успешно отправлено!");
+    if (httpCode == 200) {
+        Serial.println("✅ Сообщение успешно доставлено.");
     } else {
-        Serial.printf("❌ Telegram: Ошибка отправки! HTTP Код: %d\n", httpCode);
-        String response = http.getString();
-        Serial.println("Ответ сервера Telegram: " + response);
+        Serial.print("❌ Ошибка отправки! HTTP код: ");
+        Serial.println(httpCode);
+        if (httpCode < 0) {
+            Serial.print("   Причина: ");
+            Serial.println(http.errorToString(httpCode).c_str());
+        } else {
+            String response = http.getString();
+            Serial.print("   Ответ сервера: ");
+            Serial.println(response);
+        }
     }
     
     http.end();
-    return success;
+    return (httpCode == 200);
 }
 
-void addToBuffer(String msg) {
-    if (bufferCount < MAX_BUFFER_SIZE) {
-        messageBuffer[bufferCount] = msg;
-        bufferCount++;
-        Serial.println("📥 Сообщение добавлено в буфер.");
-    } else {
-        Serial.println("⚠️ Буфер переполнен! Старое сообщение удалено.");
-        // Сдвигаем старые сообщения
-        for (int i = 1; i < MAX_BUFFER_SIZE; i++) {
-            messageBuffer[i-1] = messageBuffer[i];
-        }
-        messageBuffer[MAX_BUFFER_SIZE-1] = msg;
-    }
+// Обработчик веб-сервера
+void handleRoot() {
+    String html = WEB_PORTAL_HTML;
+    html.replace("{{ssid}}", configManager.getSSID());
+    html.replace("{{pass}}", configManager.getPass());
+    html.replace("{{token}}", configManager.getBotToken());
+    html.replace("{{chat}}", configManager.getChatID());
+    html.replace("{{thread}}", configManager.getThreadID());
+    html.replace("{{melody_on_options}}", SoundStorage::buildMelodyOptions(configManager.getMelodyOnFile()));
+    html.replace("{{melody_off_options}}", SoundStorage::buildMelodyOptions(configManager.getMelodyOffFile()));
+    html.replace("{{volume}}", String(configManager.getBuzzerVolume()));
+    html.replace("{{msg_startup_power}}", configManager.getMsgStartupPower());
+    html.replace("{{msg_startup_battery}}", configManager.getMsgStartupBattery());
+    html.replace("{{msg_power_restored}}", configManager.getMsgPowerRestored());
+    html.replace("{{msg_power_lost}}", configManager.getMsgPowerLost());
+
+    server.send(200, "text/html", html);
 }
 
-void processMessageBuffer() {
-    if (bufferCount > 0 && isWifiConnected && isTimeSynced) {
-        if (millis() - lastBufferProcessTime >= BUFFER_PROCESS_INTERVAL) {
-            lastBufferProcessTime = millis();
-            
-            Serial.printf("📦 Отправка буфера (сообщений: %d)...\n", bufferCount);
-            if (sendTelegramMessage(messageBuffer[0])) {
-                // Если успешно отправлено, удаляем из буфера
-                for (int i = 1; i < bufferCount; i++) {
-                    messageBuffer[i-1] = messageBuffer[i];
+void handleSave() {
+    if (server.hasArg("ssid")) configManager.setSSID(server.arg("ssid"));
+    if (server.hasArg("pass")) configManager.setPass(server.arg("pass"));
+    if (server.hasArg("token")) configManager.setBotToken(server.arg("token"));
+    if (server.hasArg("chat")) configManager.setChatID(server.arg("chat"));
+    if (server.hasArg("thread")) configManager.setThreadID(server.arg("thread"));
+    if (server.hasArg("melody_on")) configManager.setMelodyOnFile(server.arg("melody_on"));
+    if (server.hasArg("melody_off")) configManager.setMelodyOffFile(server.arg("melody_off"));
+    if (server.hasArg("msg_startup_power")) configManager.setMsgStartupPower(server.arg("msg_startup_power"));
+    if (server.hasArg("msg_startup_battery")) configManager.setMsgStartupBattery(server.arg("msg_startup_battery"));
+    if (server.hasArg("msg_power_restored")) configManager.setMsgPowerRestored(server.arg("msg_power_restored"));
+    if (server.hasArg("msg_power_lost")) configManager.setMsgPowerLost(server.arg("msg_power_lost"));
+    
+    configManager.save();
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
+}
+
+void handlePlay() {
+    String file = server.arg("file");
+    String rtttl = "";
+
+    if (file.length() > 0) {
+        String filePath = "/sounds/" + file;
+        File f = LittleFS.open(filePath, "r");
+        if (f) {
+            while (f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if (line.length() > 0 && !line.startsWith("#")) {
+                    rtttl = line;
+                    break;
                 }
-                bufferCount--;
-                Serial.printf("✅ Сообщение из буфера ушло. Осталось: %d\n", bufferCount);
-            } else {
-                Serial.println("⏳ Ошибка отправки из буфера. Повтор позже.");
             }
+            f.close();
         }
+    }
+
+    if (rtttl.length() > 0) {
+        Serial.print("🎵 Предпрослушивание: ");
+        Serial.println(file);
+        buzzer.play(rtttl);
+    } else {
+        buzzer.play("preview:d=4,o=6,b=200:4c");
+    }
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleVolume() {
+    if (server.hasArg("vol")) {
+        uint8_t vol = constrain(server.arg("vol").toInt(), 0, 100);
+        buzzer.setVolume(vol);
+        configManager.setBuzzerVolume(vol);
+        configManager.save();
+        Serial.print("🔊 Громкость установлена: ");
+        Serial.print(vol);
+        Serial.println("%");
+    }
+    server.send(200, "text/plain", "OK");
+}
+
+void enterConfigMode() {
+    isConfigMode = true;
+    Serial.println("🌐 Вход в режим настройки...");
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(IPAddress(192, 168, 0, 11), IPAddress(192, 168, 0, 11), IPAddress(255, 255, 255, 0));
+    WiFi.softAP("ESS Watcher", "12345678");
+    
+    dnsServer.start(53, "*", IPAddress(192, 168, 0, 11));
+    
+    server.on("/", handleRoot);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/play", handlePlay);
+    server.on("/volume", handleVolume);
+    server.onNotFound(handleRoot); // Для Captive Portal
+    server.begin();
+    
+    // Звук входа в режим WiFi
+    String wifiSound = SoundStorage::getSystemSound("wifi_mode");
+    if (wifiSound.length() > 0) {
+        buzzer.play(wifiSound);
+    } else {
+        buzzer.play("wifi:d=4,o=6,b=400:4g");
     }
 }
 
-// Обработчик событий Wi-Fi
-void WiFiEvent(WiFiEvent_t event) {
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            Serial.print("📶✅ Подключено к Wi-Fi! IP адрес: ");
-            Serial.println(WiFi.localIP());
             isWifiConnected = true;
-            
-            // Снижаем мощность передатчика ЗДЕСЬ (после коннекта), чтобы она не сбрасывалась
-            WiFi.setTxPower(WIFI_POWER_8_5dBm);
-            // Включаем энергосбережение модема
+            Serial.print("🌐 WiFi подключен! IP: ");
+            Serial.println(WiFi.localIP());
             WiFi.setSleep(WIFI_PS_MIN_MODEM);
-            
-            // Запускаем асинхронную синхронизацию времени
             if (!isTimeSynced && !ntpSyncStarted) {
                 ntpSyncStarted = true;
-                configTime(0, 0, "pool.ntp.org", "time.nist.gov", "162.159.200.1");
-                Serial.print("🔄 Синхронизация времени NTP");
+                configTime(0, 0, "pool.ntp.org", "time.nist.gov");
             }
             break;
-            
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            Serial.println("📶❌ Wi-Fi отключен! Попытка переподключения...");
+            if (isWifiConnected) {
+                Serial.println("⚠️ WiFi соединение потеряно.");
+            }
+            Serial.print("ℹ️ Причина отключения: ");
+            Serial.println(info.wifi_sta_disconnected.reason);
             isWifiConnected = false;
-            WiFi.reconnect();
+            if (!isConfigMode) WiFi.reconnect();
             break;
-            
-        default:
-            break;
+        default: break;
     }
 }
 
-// =====================================================================================
-// =                                  SETUP & LOOP                                     =
-// =====================================================================================
-
 void setup() {
+    delay(2000); // Даем время USB-порту инициализироваться в системе
     Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n\n=== Запуск ESS Watcher (Pro Edition) ===");
-
-    // Оптимизация памяти: резервируем место под строковые объекты в куче
-    for (int i = 0; i < MAX_BUFFER_SIZE; i++) {
-        messageBuffer[i].reserve(256);
-    }
-
+    Serial.println("\n\n====================================");
+    Serial.println("🚀 ESS Watcher: СИСТЕМА ЗАПУЩЕНА");
+    Serial.println("====================================\n");
+    
+    configManager.begin();
+    SoundStorage::begin();
+    SoundStorage::listSounds();
+    
     pinMode(PIN_POWER_SENSE, INPUT_PULLDOWN);
-
-    // Инициализация WS2812B
+    pinMode(PIN_CONFIG_BUTTON, INPUT_PULLUP);
+    
     FastLED.addLeds<WS2812B, PIN_LED_DATA, GRB>(leds, NUM_LEDS);
-    setRGBColor(CRGB::Yellow); // Желтый - запуск
-
-    // Настройка SSL
+    buzzer.begin(PIN_BUZZER, 0);
+    buzzer.setVolume(configManager.getBuzzerVolume());
+    
     secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-
-    // Первичное считывание пина питания (сразу устанавливаем стейт)
+    
     isPowerOn = digitalRead(PIN_POWER_SENSE) == HIGH;
     lastPowerState = isPowerOn;
     potentialPowerState = isPowerOn;
 
-    if (wifiEnabled) {
-        Serial.println("Подключение к Wi-Fi: " + String(WIFI_SSID));
-        
-        WiFi.onEvent(WiFiEvent);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    // Звук включения устройства
+    String startupSound = SoundStorage::getSystemSound("startup");
+    if (startupSound.length() > 0) {
+        buzzer.play(startupSound);
     } else {
-        Serial.println("Wi-Fi отключен в настройках.");
+        buzzer.play("startup:d=4,o=6,b=300:4b");
     }
+
+    WiFi.onEvent(WiFiEvent);
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_5dBm); // Ограничиваем мощность СРАЗУ для стабильности питания
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(configManager.getSSID(), configManager.getPass());
 }
 
 void loop() {
-    // 1. Асинхронные сервисные задачи
-    checkNTPStatusAsync();
-    handleBuzzerAsync();
-    processMessageBuffer();
+    if (isConfigMode) {
+        dnsServer.processNextRequest();
+        server.handleClient();
+        buzzer.handleAsync();
+        handleStatusIndicationAsync();
+        return;
+    }
 
-    // 2. Отложенная отправка стартового сообщения (когда NTP готов)
+    // 1. Асинхронные задачи
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat >= 5000) {
+        lastHeartbeat = millis();
+        Serial.print("💓 Система работает... WiFi: ");
+        Serial.print(isWifiConnected ? "OK " : "НЕТ ");
+        Serial.print("| Сеть 220В: ");
+        Serial.println(isPowerOn ? "ECTЬ" : "НЕТ");
+    }
+
+    checkNTPStatusAsync();
+    buzzer.handleAsync();
+    handleStatusIndicationAsync();
+
+    // 2. Кнопка настройки
+    bool btnState = digitalRead(PIN_CONFIG_BUTTON) == LOW;
+    if (btnState && !isButtonPressed) {
+        isButtonPressed = true;
+        buttonPressStartTime = millis();
+    } else if (!btnState && isButtonPressed) {
+        isButtonPressed = false;
+    }
+    
+    if (isButtonPressed && (millis() - buttonPressStartTime >= CONFIG_HOLD_TIME)) {
+        enterConfigMode();
+    }
+
+    // 3. Стартовое сообщение
     if (needsStartupMessage) {
         needsStartupMessage = false;
         startupMessageSent = true;
-        
         if (isPowerOn) {
-            sendTelegramMessage("🚀 ⚡️ ✅ Датчик и сеть 220В подключена!");
-            setRGBColor(CRGB::Green);
+            sendTelegramMessage(configManager.getMsgStartupPower());
         } else {
-            sendTelegramMessage("🚀 ❌ ⚠️ Датчик от АКБ, сеть 220В ОТКЛЮЧЕНА!");
-            setRGBColor(CRGB::Red);
+            sendTelegramMessage(configManager.getMsgStartupBattery());
         }
     }
 
-    // 3. Аппаратный мониторинг пина с АНТИДРЕБЕЗГОМ (Debounce)
+    // 4. Мониторинг питания
     if (millis() - lastPowerCheckTime >= POWER_CHECK_INTERVAL) {
         lastPowerCheckTime = millis();
         bool currentReading = digitalRead(PIN_POWER_SENSE) == HIGH;
 
-        if (currentReading == potentialPowerState) {
-            debounceCounter++;
-        } else {
-            debounceCounter = 0;
-            potentialPowerState = currentReading;
-        }
+        if (currentReading == potentialPowerState) debounceCounter++;
+        else { debounceCounter = 0; potentialPowerState = currentReading; }
 
-        // Если состояние стабильно на протяжении DEBOUNCE_THRESHOLD чтений
         if (debounceCounter >= DEBOUNCE_THRESHOLD) {
             if (potentialPowerState != lastPowerState) {
                 lastPowerState = potentialPowerState;
                 isPowerOn = potentialPowerState;
 
                 if (isPowerOn) {
-                    Serial.println("⚡ Сеть 220В ВОССТАНОВЛЕНА!");
-                    setRGBColor(CRGB::Green);
-                    startBuzzer(2000, 200); // Короткий писк
-                    
-                    if (!sendTelegramMessage("⚡ Сеть 220В ВОССТАНОВЛЕНА!")) {
-                        addToBuffer("⚡ Сеть 220В ВОССТАНОВЛЕНА!");
-                    }
+                    Serial.println("⚡ Питание: СЕТЬ 220В ВОССТАНОВЛЕНА");
+                    playMelody(configManager.getMelodyOnFile(), true);
+                    sendTelegramMessage(configManager.getMsgPowerRestored());
                 } else {
-                    Serial.println("⚠️ Сеть 220В ОТКЛЮЧЕНА!");
-                    setRGBColor(CRGB::Red);
-                    startBuzzer(1000, 1000); // Длинный гудок
-                    
-                    if (!sendTelegramMessage("🚨 ОТКЛЮЧЕНИЕ ПИТАНИЯ 220В! Работа от АКБ 🔋.")) {
-                        addToBuffer("🚨 ОТКЛЮЧЕНИЕ ПИТАНИЯ 220В! Работа от АКБ 🔋");
-                    }
+                    Serial.println("🚨 Питание: ОТКЛЮЧЕНИЕ 220В!");
+                    playMelody(configManager.getMelodyOffFile(), false);
+                    sendTelegramMessage(configManager.getMsgPowerLost());
                 }
             }
         }
     }
-
-    // 4. ЭНЕРГОСБЕРЕЖЕНИЕ (Освобождение CPU для FreeRTOS Idle Task)
-    // Эта микро-пауза позволяет ядру перевести чип в Light Sleep,
-    // радикально снижая энергопотребление и нагрев.
-    delay(200);
+    delay(10);
 }
