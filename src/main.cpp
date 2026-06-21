@@ -7,6 +7,7 @@
 #include <UniversalTelegramBot.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include "esp_bt.h"
 #include "secrets.h"
 #include "ConfigManager.h"
 #include "WebPortal.h"
@@ -14,8 +15,10 @@
 #include "SoundStorage.h"
 
 // =====================================================================================
-// =                               НАСТРОЙКИ ПИНОВ                                     =
+// =                              CORE FUNCTIONS                                        =
 // =====================================================================================
+
+bool isQuietHours(); // forward declaration (используется в checkNTPStatusAsync)
 
 const int PIN_POWER_SENSE = 0; // Пин для мониторинга 3.3В (через делитель на 3.3В!) от блока питания 220В
 const int PIN_BUZZER = 2;      // Пин для зуммера
@@ -43,6 +46,14 @@ const unsigned long POWER_CHECK_INTERVAL = 500;    // Проверка пина 
 const int DEBOUNCE_THRESHOLD = 5;                   
 const unsigned long CONFIG_HOLD_TIME = 2000;       // Время удержания для входа в настройки
 
+// §5.5: мягкий старт — отсрочка тяжёлой периферии на 2 с после старта (даёт стабилизироваться boost-конвертеру UPS).
+//       Реализована через millis() (НЕ delay), чтобы CPU мог уйти в IDLE и не жечь ток.
+const unsigned long SOFT_START_DELAY_MS = 2000;
+// §3.1/§5.6: задержка перед поднятием WiFi и стартовым сообщением (3–5 с после soft-start).
+const unsigned long WIFI_STARTUP_DELAY_MS = 4000;
+// §2.3: при смене статуса сети светодиод полностью выключается на 3 с (чтобы не добавлять пиковый ток в момент события)
+const unsigned long LED_BLACKOUT_AFTER_EVENT_MS = 3000;
+
 // Состояние питания
 bool isPowerOn = false;
 bool lastPowerState = false;
@@ -53,15 +64,34 @@ bool potentialPowerState = false;
 // Состояние Wi-Fi и Системы
 bool isWifiConnected = false;
 bool isTimeSynced = false;
-bool startupMessageSent = false;  
+bool startupMessageSent = false;
 bool ntpSyncStarted = false;
 unsigned long lastNTPCheckTime = 0;
-bool needsStartupMessage = false;
 bool isConfigMode = false;
+
+// §2.1/§5.6: отложенное сообщение — отправляется ПОСЛЕ завершения мелодии (анти-коллизия тока).
+// В startup-фазе сюда кладётся стартовое/событийное сообщение, в loop — при смене статуса.
+String pendingMessage = "";
+// §2.1: источник pendingMessage — ждать ли конца мелодии перед отправкой
+bool pendingMessageAwaitMelody = false;
+
+// §5.5: фаза запуска устройства (мягкий старт через millis)
+unsigned long bootTime = 0;             // millis() в момент выхода из setup()
+bool softStartComplete = false;         // прошёл ли мягкий старт (тяжёлая периферия включена)
+
+// §3.1: lazy WiFi — WiFi поднимается не сразу, а по истечении WIFI_STARTUP_DELAY_MS
+bool wifiStarted = false;
+
+// §2.3: тайминг «затемнения» LED после события сети
+unsigned long ledBlackoutUntil = 0;     // до этого момента LED принудительно выключен
 
 // Индикация (двойной "пых" раз в 2 секунды)
 unsigned long lastBlinkCycleTime = 0;
 const unsigned long BLINK_INTERVAL = 2000;
+
+// §2.4: кэш последнего отправленного в WS2812B цвета (чтобы не дёргать FastLED.show() без изменений)
+CRGB lastSentColor = CRGB::Black;
+bool ledInited = false;
 
 // Управление кнопкой
 unsigned long buttonPressStartTime = 0;
@@ -72,8 +102,21 @@ bool isButtonPressed = false;
 // =====================================================================================
 
 void setRGBColor(CRGB color) {
+    // §2.4: передаём в WS2812B только при изменении — экономим SPI/DMA и ток.
+    if (!ledInited || leds[0] != color || lastSentColor != color) {
+        leds[0] = color;
+        FastLED.show();
+        lastSentColor = color;
+        ledInited = true;
+    }
+}
+
+void setRGBColorForced(CRGB color) {
+    // Принудительная передача (для режимов, где состояние важно гарантированно выставить)
     leds[0] = color;
     FastLED.show();
+    lastSentColor = color;
+    ledInited = true;
 }
 
 void playMelody(const char* melodyFile, bool powerOn) {
@@ -115,6 +158,12 @@ void playMelody(const char* melodyFile, bool powerOn) {
 
 // Асинхронная индикация статуса: короткий двойной "пых" раз в 2 секунды
 void handleStatusIndicationAsync() {
+    // §2.3: затемнение LED после смены статуса сети — на это время LED полностью выключен.
+    if (millis() < ledBlackoutUntil) {
+        setRGBColor(CRGB::Black);
+        return;
+    }
+
     unsigned long currentMillis = millis();
     unsigned long elapsed = currentMillis - lastBlinkCycleTime;
     
@@ -144,6 +193,22 @@ void handleStatusIndicationAsync() {
     }
 }
 
+// §2.1/§3.1/§5.6: постановка сообщения в очередь (с возможностью дождаться мелодии).
+//   Используется и для стартового сообщения, и для события сети.
+void queueMessage(const String& msg, bool awaitMelody) {
+    pendingMessage = msg;
+    pendingMessageAwaitMelody = awaitMelody;
+}
+
+// §5.6: проверка — был ли ресет после brownout во время работы от сети?
+//   Сравниваем последнее подтверждённое состояние (из NVS) с текущим чтением пина.
+bool isRebootAfterBrownout() {
+    bool saved = configManager.getLastKnownPowerState();
+    bool now = digitalRead(PIN_POWER_SENSE) == HIGH;
+    // Если сохранено «сеть была», а сейчас пин LOW — это switchover-ресет (сеть только что пропала).
+    return saved && !now;
+}
+
 void checkNTPStatusAsync() {
     if (ntpSyncStarted && !isTimeSynced) {
         if (millis() - lastNTPCheckTime >= 1000) {
@@ -153,7 +218,30 @@ void checkNTPStatusAsync() {
                 Serial.println("\n✅ Время синхронизировано!");
                 isTimeSynced = true;
                 ntpSyncStarted = false;
-                if (!startupMessageSent) needsStartupMessage = true;
+                // §5.6: стартовое сообщение готовим только если это НЕ brownout-ресет.
+                //   При brownout вместо «startup_battery» уйдёт «power_lost» (см. setup()).
+                if (!startupMessageSent) {
+                    // Если событие сети уже поставило сообщение в очередь — стартовое не нужно
+                    if (pendingMessage.length() > 0) {
+                        Serial.println("🔕 Стартовое сообщение пропущено: уже есть событие сети в очереди.");
+                        startupMessageSent = true;
+                    } else if (isRebootAfterBrownout()) {
+                        Serial.println("🔔 Обнаружен brownout-ресет: сеть 220В пропала. Готовлю событие «power lost».");
+                        if (!isQuietHours()) {
+                            playMelody(configManager.getMelodyOffFile(), false);
+                            queueMessage(configManager.getMsgPowerLost(), /*awaitMelody=*/true);
+                        } else {
+                            queueMessage(configManager.getMsgPowerLost(), /*awaitMelody=*/false);
+                        }
+                        startupMessageSent = true;
+                    } else {
+                        bool awaitMelody = buzzer.playing();
+                        queueMessage(isPowerOn ? configManager.getMsgStartupPower()
+                                               : configManager.getMsgStartupBattery(),
+                                     awaitMelody);
+                        startupMessageSent = true;
+                    }
+                }
             }
         }
     }
@@ -168,17 +256,20 @@ bool sendTelegramMessage(String msg) {
         Serial.println("❌ Ошибка: Время не синхронизировано (NTP). Сообщение пропущено.");
         return false;
     }
-    
+
     Serial.print("📤 Отправка в Telegram: ");
     Serial.println(msg);
 
+    // §6.3: TLS-хэндшейк требует высокой частоты — поднимаем CPU на время запроса.
+    setCpuFrequencyMhz(160);
+
     HTTPClient http;
     String url = "https://api.telegram.org/bot" + String(configManager.getBotToken()) + "/sendMessage";
-    
+
     http.begin(secured_client, url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
-    
+
     StaticJsonDocument<512> doc;
     doc["chat_id"] = configManager.getChatID();
     doc["text"] = msg;
@@ -186,11 +277,11 @@ bool sendTelegramMessage(String msg) {
     if (threadId.length() > 0 && threadId != "0" && threadId != "null") {
         doc["message_thread_id"] = threadId.toInt();
     }
-    
+
     String payload;
     serializeJson(doc, payload);
     int httpCode = http.POST(payload);
-    
+
     if (httpCode == 200) {
         Serial.println("✅ Сообщение успешно доставлено.");
     } else {
@@ -205,9 +296,31 @@ bool sendTelegramMessage(String msg) {
             Serial.println(response);
         }
     }
-    
+
     http.end();
+
+    // §6.3: возвращаем экономную частоту
+    setCpuFrequencyMhz(80);
     return (httpCode == 200);
+}
+
+// Проверка: сейчас тихий час? (мелодии не воспроизводятся)
+bool isQuietHours() {
+    if (!configManager.getQuietHoursEnabled()) return false;
+    if (!isTimeSynced) return false;
+
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    int currentMinutes = t->tm_hour * 60 + t->tm_min;
+
+    int startMinutes = configManager.getQuietStartHour() * 60 + configManager.getQuietStartMinute();
+    int endMinutes   = configManager.getQuietEndHour()   * 60 + configManager.getQuietEndMinute();
+
+    if (startMinutes < endMinutes) {
+        return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+    } else {
+        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    }
 }
 
 // Обработчик веб-сервера
@@ -225,6 +338,11 @@ void handleRoot() {
     html.replace("{{msg_startup_battery}}", configManager.getMsgStartupBattery());
     html.replace("{{msg_power_restored}}", configManager.getMsgPowerRestored());
     html.replace("{{msg_power_lost}}", configManager.getMsgPowerLost());
+    html.replace("{{quiet_checked}}", configManager.getQuietHoursEnabled() ? "checked" : "");
+    html.replace("{{quiet_start_hour}}", String(configManager.getQuietStartHour()));
+    html.replace("{{quiet_start_minute}}", String(configManager.getQuietStartMinute()));
+    html.replace("{{quiet_end_hour}}", String(configManager.getQuietEndHour()));
+    html.replace("{{quiet_end_minute}}", String(configManager.getQuietEndMinute()));
 
     server.send(200, "text/html", html);
 }
@@ -241,6 +359,11 @@ void handleSave() {
     if (server.hasArg("msg_startup_battery")) configManager.setMsgStartupBattery(server.arg("msg_startup_battery"));
     if (server.hasArg("msg_power_restored")) configManager.setMsgPowerRestored(server.arg("msg_power_restored"));
     if (server.hasArg("msg_power_lost")) configManager.setMsgPowerLost(server.arg("msg_power_lost"));
+    configManager.setQuietHoursEnabled(server.hasArg("quiet_enabled"));
+    if (server.hasArg("quiet_start_hour")) configManager.setQuietStartHour(server.arg("quiet_start_hour").toInt());
+    if (server.hasArg("quiet_start_minute")) configManager.setQuietStartMinute(server.arg("quiet_start_minute").toInt());
+    if (server.hasArg("quiet_end_hour")) configManager.setQuietEndHour(server.arg("quiet_end_hour").toInt());
+    if (server.hasArg("quiet_end_minute")) configManager.setQuietEndMinute(server.arg("quiet_end_minute").toInt());
     
     configManager.save();
     server.send(200, "text/plain", "OK");
@@ -344,45 +467,93 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 void setup() {
-    delay(2000); // Даем время USB-порту инициализироваться в системе
+    // §5.5: мягкий старт — НЕ блокируем ядро delay()'ем. Тяжёлая периферия (LED/зуммер/WiFi)
+    //       включается по истечении SOFT_START_DELAY_MS через millis() в loop().
+    //       Это даёт boost-конвертеру UPS время стабилизироваться без стартового пика тока.
     Serial.begin(115200);
     Serial.println("\n\n====================================");
     Serial.println("🚀 ESS Watcher: СИСТЕМА ЗАПУЩЕНА");
     Serial.println("====================================\n");
-    
+
+    // §4.1: полностью выключаем и освобождаем BT/BLE (цель №4 — никакого Bluetooth).
+    //       Делаем в самом начале, до поднятия любой периферии.
+    btStop();
+    esp_bt_controller_disable();
+    esp_bt_mem_release(ESP_BT_MODE_BTDM);
+    Serial.println("🔇 BT/BLE отключён, память освобождена.");
+
+    // §6.3: стартуем на экономной частоте 80 МГц. До 160 МГц поднимаемся только на время SSL.
+    setCpuFrequencyMhz(80);
+
     configManager.begin();
+    setenv("TZ", configManager.getTimezone(), 1);
+    tzset();
     SoundStorage::begin();
     SoundStorage::listSounds();
-    
+
     pinMode(PIN_POWER_SENSE, INPUT_PULLDOWN);
     pinMode(PIN_CONFIG_BUTTON, INPUT_PULLUP);
-    
-    FastLED.addLeds<WS2812B, PIN_LED_DATA, GRB>(leds, NUM_LEDS);
-    buzzer.begin(PIN_BUZZER, 0);
-    buzzer.setVolume(configManager.getBuzzerVolume());
-    
-    secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-    
+
+    // §5.5/§5.6: читаем статус сети СРАЗУ (до WiFi, до тяжёлой периферии).
+    //   Это безопасно: цифровой пин не нагружает UPS.
     isPowerOn = digitalRead(PIN_POWER_SENSE) == HIGH;
     lastPowerState = isPowerOn;
     potentialPowerState = isPowerOn;
 
-    // Звук включения устройства
-    String startupSound = SoundStorage::getSystemSound("startup");
-    if (startupSound.length() > 0) {
-        buzzer.play(startupSound);
-    } else {
-        buzzer.play("startup:d=4,o=6,b=300:4b");
-    }
+    secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
 
-    WiFi.onEvent(WiFiEvent);
-    WiFi.mode(WIFI_STA);
-    WiFi.setTxPower(WIFI_POWER_5dBm); // Ограничиваем мощность СРАЗУ для стабильности питания
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(configManager.getSSID(), configManager.getPass());
+    bootTime = millis();
+    softStartComplete = false;
+    wifiStarted = false;
+    Serial.println("⏳ Мягкий старт: тяжёлая периферия будет включена через 2 с.");
 }
 
 void loop() {
+    // §5.5: мягкий старт — тяжёлая периферия (LED/зуммер/WiFi) включается через 2 с.
+    //       До этого момента loop() крутится лёгким циклом, CPU в IDLE на 80 МГц.
+    if (!softStartComplete) {
+        if (millis() - bootTime >= SOFT_START_DELAY_MS) {
+            softStartComplete = true;
+            Serial.println("✅ Мягкий старт завершён. Включаю периферию.");
+
+            FastLED.addLeds<WS2812B, PIN_LED_DATA, GRB>(leds, NUM_LEDS);
+            buzzer.begin(PIN_BUZZER, 0);
+            buzzer.setVolume(configManager.getBuzzerVolume());
+
+            // Звук включения устройства (только при настоящем старте, не brownout, не в тихий час)
+            if (!isRebootAfterBrownout() && !isQuietHours()) {
+                String startupSound = SoundStorage::getSystemSound("startup");
+                if (startupSound.length() > 0) {
+                    buzzer.play(startupSound);
+                } else {
+                    buzzer.play("startup:d=4,o=6,b=300:4b");
+                }
+            } else {
+                if (isRebootAfterBrownout()) {
+                    Serial.println("⏭️ Brownout-ресет: startup-звук пропускаю.");
+                } else {
+                    Serial.println("🔇 Тихий режим: startup-звук пропускаю.");
+                }
+            }
+        } else {
+            return; // ещё рано — крутимся лёгким циклом
+        }
+    }
+
+    // §3.1/§5.6: lazy WiFi — поднимаем спустя WIFI_STARTUP_DELAY_MS после soft-start,
+    //            НЕ при включении устройства (цель №3).
+    if (softStartComplete && !wifiStarted) {
+        if (millis() - bootTime >= SOFT_START_DELAY_MS + WIFI_STARTUP_DELAY_MS) {
+            wifiStarted = true;
+            Serial.println("🌐 Поднимаю WiFi (lazy-init)...");
+            WiFi.onEvent(WiFiEvent);
+            WiFi.mode(WIFI_STA);
+            WiFi.setTxPower(WIFI_POWER_5dBm);   // §2.1: ограничиваем TX-мощность (анти-скачок тока)
+            WiFi.setAutoReconnect(true);
+            WiFi.begin(configManager.getSSID(), configManager.getPass());
+        }
+    }
+
     if (isConfigMode) {
         dnsServer.processNextRequest();
         server.handleClient();
@@ -413,23 +584,25 @@ void loop() {
     } else if (!btnState && isButtonPressed) {
         isButtonPressed = false;
     }
-    
+
     if (isButtonPressed && (millis() - buttonPressStartTime >= CONFIG_HOLD_TIME)) {
         enterConfigMode();
     }
 
-    // 3. Стартовое сообщение
-    if (needsStartupMessage) {
-        needsStartupMessage = false;
-        startupMessageSent = true;
-        if (isPowerOn) {
-            sendTelegramMessage(configManager.getMsgStartupPower());
-        } else {
-            sendTelegramMessage(configManager.getMsgStartupBattery());
+    // §2.1: отправка отложенного сообщения — ТОЛЬКО после завершения мелодии.
+    //       Пока играет мелодия, не дёргаем WiFi/TLS — это исключает коллизию токов.
+    //       Для стартового сообщения awaitMelody=false (мелодии нет параллельно).
+    if (pendingMessage.length() > 0) {
+        bool canSend = !pendingMessageAwaitMelody || !buzzer.playing();
+        if (canSend) {
+            String msg = pendingMessage;
+            pendingMessage = "";
+            pendingMessageAwaitMelody = false;
+            sendTelegramMessage(msg);
         }
     }
 
-    // 4. Мониторинг питания
+    // 3. Мониторинг питания
     if (millis() - lastPowerCheckTime >= POWER_CHECK_INTERVAL) {
         lastPowerCheckTime = millis();
         bool currentReading = digitalRead(PIN_POWER_SENSE) == HIGH;
@@ -442,14 +615,31 @@ void loop() {
                 lastPowerState = potentialPowerState;
                 isPowerOn = potentialPowerState;
 
+                // §5.6: сохраняем новое состояние в NVS (для распознавания brownout при следующем старте)
+                configManager.setLastKnownPowerState(isPowerOn);
+                configManager.save();
+
+                // §2.3: гасим LED на 3 с — не добавляем пиковый ток в момент события
+                ledBlackoutUntil = millis() + LED_BLACKOUT_AFTER_EVENT_MS;
+
+                // §2.1: СНАЧАЛА мелодия, ПОТОМ сообщение (после завершения мелодии).
+                //       pendingMessage уйдёт в Telegram только когда buzzer.playing() == false.
                 if (isPowerOn) {
                     Serial.println("⚡ Питание: СЕТЬ 220В ВОССТАНОВЛЕНА");
-                    playMelody(configManager.getMelodyOnFile(), true);
-                    sendTelegramMessage(configManager.getMsgPowerRestored());
+                    if (!isQuietHours()) {
+                        playMelody(configManager.getMelodyOnFile(), true);
+                        queueMessage(configManager.getMsgPowerRestored(), /*awaitMelody=*/true);
+                    } else {
+                        queueMessage(configManager.getMsgPowerRestored(), /*awaitMelody=*/false);
+                    }
                 } else {
                     Serial.println("🚨 Питание: ОТКЛЮЧЕНИЕ 220В!");
-                    playMelody(configManager.getMelodyOffFile(), false);
-                    sendTelegramMessage(configManager.getMsgPowerLost());
+                    if (!isQuietHours()) {
+                        playMelody(configManager.getMelodyOffFile(), false);
+                        queueMessage(configManager.getMsgPowerLost(), /*awaitMelody=*/true);
+                    } else {
+                        queueMessage(configManager.getMsgPowerLost(), /*awaitMelody=*/false);
+                    }
                 }
             }
         }
