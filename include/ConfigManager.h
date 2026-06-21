@@ -25,6 +25,16 @@ private:
         char msg_startup_battery[200];
         char msg_power_restored[200];
         char msg_power_lost[200];
+        bool last_known_power_state; // §5.6: последнее подтверждённое состояние сети (для отличия ресета от события)
+        // --- Тихий режим (quiet hours) для зуммера ---
+        bool quiet_hours_enabled;   // включён ли тихий режим
+        uint8_t quiet_start_hour;   // час начала (0-23), дефолт 22
+        uint8_t quiet_start_minute; // минута начала (0-59)
+        uint8_t quiet_end_hour;     // час конца   (0-23), дефолт 8
+        uint8_t quiet_end_minute;   // минута конца (0-59)
+        // --- Часовой пояс (для тихого режима по местному времени) ---
+        //  Синтаксис POSIX: "EET-2EEST,M3.5.0/3,M10.5.0/4" (Киев, с DST).
+        char timezone[48];
     } data;
 
 public:
@@ -53,7 +63,17 @@ public:
             strncpy(data.msg_startup_battery, DEFAULT_MSG_STARTUP_BATTERY, sizeof(data.msg_startup_battery));
             strncpy(data.msg_power_restored, DEFAULT_MSG_POWER_RESTORED, sizeof(data.msg_power_restored));
             strncpy(data.msg_power_lost, DEFAULT_MSG_POWER_LOST, sizeof(data.msg_power_lost));
-            
+            data.last_known_power_state = true; // §5.6: дефолт — «сеть была» (предполагаем нормальный старт)
+
+            // Тихий режим: выключен по умолчанию (музыка играет всегда), интервал 22:00–08:00.
+            data.quiet_hours_enabled = false;
+            data.quiet_start_hour = 22;
+            data.quiet_start_minute = 0;
+            data.quiet_end_hour = 8;
+            data.quiet_end_minute = 0;
+            // Часовой пояс по умолчанию — Киев (EET/EEST с DST).
+            strncpy(data.timezone, "EET-2EEST,M3.5.0/3,M10.5.0/4", sizeof(data.timezone));
+
             save(); // Сохраняем дефолты
         } else {
             Serial.println("✅ Config: Settings loaded from NVS.");
@@ -78,6 +98,13 @@ public:
     const char* getMsgStartupBattery() const { return data.msg_startup_battery; }
     const char* getMsgPowerRestored() const { return data.msg_power_restored; }
     const char* getMsgPowerLost() const { return data.msg_power_lost; }
+    bool getLastKnownPowerState() const { return data.last_known_power_state; } // §5.6
+    bool getQuietHoursEnabled() const { return data.quiet_hours_enabled; }
+    uint8_t getQuietStartHour() const { return data.quiet_start_hour; }
+    uint8_t getQuietStartMinute() const { return data.quiet_start_minute; }
+    uint8_t getQuietEndHour() const { return data.quiet_end_hour; }
+    uint8_t getQuietEndMinute() const { return data.quiet_end_minute; }
+    const char* getTimezone() const { return data.timezone; }
 
     // Setters (with safety)
     void setSSID(const String& val) { strncpy(data.wifi_ssid, val.c_str(), sizeof(data.wifi_ssid)); }
@@ -92,4 +119,11 @@ public:
     void setMsgStartupBattery(const String& val) { strncpy(data.msg_startup_battery, val.c_str(), sizeof(data.msg_startup_battery)); }
     void setMsgPowerRestored(const String& val) { strncpy(data.msg_power_restored, val.c_str(), sizeof(data.msg_power_restored)); }
     void setMsgPowerLost(const String& val) { strncpy(data.msg_power_lost, val.c_str(), sizeof(data.msg_power_lost)); }
+    void setLastKnownPowerState(bool state) { data.last_known_power_state = state; } // §5.6
+    void setQuietHoursEnabled(bool v) { data.quiet_hours_enabled = v; }
+    void setQuietStartHour(uint8_t h) { data.quiet_start_hour = constrain(h, (uint8_t)0, (uint8_t)23); }
+    void setQuietStartMinute(uint8_t m) { data.quiet_start_minute = constrain(m, (uint8_t)0, (uint8_t)59); }
+    void setQuietEndHour(uint8_t h) { data.quiet_end_hour = constrain(h, (uint8_t)0, (uint8_t)23); }
+    void setQuietEndMinute(uint8_t m) { data.quiet_end_minute = constrain(m, (uint8_t)0, (uint8_t)59); }
+    void setTimezone(const String& v) { strncpy(data.timezone, v.c_str(), sizeof(data.timezone) - 1); data.timezone[sizeof(data.timezone) - 1] = '\0'; }
 };

@@ -284,6 +284,81 @@ const char WEB_PORTAL_HTML[] PROGMEM = R"=====(
             background: #10b981;
         }
 
+        .quiet-toggle {
+            position: relative;
+            display: inline-block;
+            width: 48px;
+            height: 26px;
+        }
+
+        .quiet-toggle input { opacity: 0; width: 0; height: 0; }
+
+        .quiet-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #cbd5e1;
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+
+        .quiet-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+
+        input:checked + .quiet-slider { background-color: var(--green); }
+        input:checked + .quiet-slider:before { transform: translateX(22px); }
+
+        .quiet-row {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        .quiet-label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #475569;
+            white-space: nowrap;
+        }
+
+        .quiet-time-row {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .quiet-time-row input[type="number"] {
+            width: 52px;
+            padding: 0.5rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            text-align: center;
+            box-sizing: border-box;
+            background: white;
+        }
+
+        .quiet-time-row span {
+            font-weight: 600;
+            color: #64748b;
+        }
+
+        .quiet-time-row input[type="number"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
         button.success::after {
             content: ' ✓ Сохранено';
         }
@@ -376,6 +451,36 @@ const char WEB_PORTAL_HTML[] PROGMEM = R"=====(
                     <button type="button" class="vol-btn" data-vol="100" onclick="setVolume(100)">100%</button>
                 </div>
                 <button type="button" class="vol-mute-btn" data-vol="0" onclick="setMute()" id="muteBtn">🔇 Без звука</button>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="field">
+                <div class="section-title">
+                    <span class="icon">🌙</span>
+                    <span>Тихий режим</span>
+                </div>
+                <div class="quiet-row" style="margin-bottom:0.6rem">
+                    <span class="quiet-label">Включить</span>
+                    <label class="quiet-toggle">
+                        <input type="checkbox" name="quiet_enabled" id="quiet_enabled" {{quiet_checked}}>
+                        <span class="quiet-slider"></span>
+                    </label>
+                </div>
+                <div class="quiet-row" style="margin-bottom:0.4rem">
+                    <span class="quiet-label">С</span>
+                    <div class="quiet-time-row">
+                        <input type="number" name="quiet_start_hour" min="0" max="23" value="{{quiet_start_hour}}">
+                        <span>:</span>
+                        <input type="number" name="quiet_start_minute" min="0" max="59" value="{{quiet_start_minute}}">
+                    </div>
+                    <span class="quiet-label">до</span>
+                    <div class="quiet-time-row">
+                        <input type="number" name="quiet_end_hour" min="0" max="23" value="{{quiet_end_hour}}">
+                        <span>:</span>
+                        <input type="number" name="quiet_end_minute" min="0" max="59" value="{{quiet_end_minute}}">
+                    </div>
+                </div>
             </div>
 
             <div class="divider"></div>
